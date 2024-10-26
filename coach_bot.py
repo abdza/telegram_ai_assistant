@@ -1,4 +1,5 @@
 # bot.py
+import io
 import json
 import logging
 import os
@@ -209,6 +210,61 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
 
+async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for file uploads"""
+    if str(update.message.chat_id) != CHAT_ID:
+        return
+
+    try:
+        # Get file information
+        file = update.message.document
+        file_info = await context.bot.get_file(file.file_id)
+
+        logging.info(f"Received file: {file.file_name}")
+
+        # Create a message with the file URL and any caption
+        caption = update.message.caption or "File uploaded"
+        message_text = f"{datetime.now()} - {caption}"
+
+        # Download file and convert to file-like object
+        file_bytes = await file_info.download_as_bytearray()
+        file_obj = io.BytesIO(file_bytes)
+        # Set the name attribute for proper MIME type detection
+        file_obj.name = file.file_name
+
+        # Upload file to OpenAI
+        file_response = client.files.create(file=file_obj, purpose="assistants")
+
+        # Send message with file to the thread
+        thread_message = client.beta.threads.messages.create(
+            thread_id=config["thread_id"],
+            role="user",
+            content=[{"type": "text", "text": message_text}],
+            attachments=[
+                {"file_id": file_response.id, "tools": [{"type": "file_search"}]}
+            ],
+        )
+
+        run = client.beta.threads.runs.create_and_poll(
+            thread_id=config["thread_id"], assistant_id="asst_KGI7hfOHHJlH367w9QSeQtbJ"
+        )
+
+        thread_messages = client.beta.threads.messages.list(config["thread_id"])
+
+        response = ""
+        for msg in thread_messages.data:
+            if msg.run_id == run.id:
+                response = msg.content[0].text.value
+
+        await update.message.reply_text(response)
+
+    except Exception as e:
+        logging.error(f"Error handling file upload: {str(e)}")
+        await update.message.reply_text(
+            f"Sorry, I encountered an error processing your file: {str(e)}"
+        )
+
+
 async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Error handler"""
     logging.error(f"Update {update} caused error {context.error}")
@@ -228,6 +284,7 @@ def main():
         )
         app.add_handler(MessageHandler(filters.PHOTO, handle_image_message))
         app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
+        app.add_handler(MessageHandler(filters.Document.ALL, handle_file_upload))
 
         # Add error handler
         app.add_error_handler(error)
