@@ -1,10 +1,12 @@
 # bot.py
 import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 
 from openai import OpenAI
+from pydub import AudioSegment
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -19,17 +21,22 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 
+# Create voices directory if it doesn't exist
+VOICES_DIR = Path("voices")
+VOICES_DIR.mkdir(exist_ok=True)
+
+
 # Load configuration
 def load_config():
     with open("config.json", "r") as config_file:
         return json.load(config_file)
 
+
 config = load_config()
 CHAT_ID = config["chat_id"]
 BOT_TOKEN = config["bot_token"]
-client = OpenAI(
-    api_key=config["OPENAI_API_KEY"]
-)
+client = OpenAI(api_key=config["OPENAI_API_KEY"])
+
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for /start command"""
@@ -39,6 +46,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hello! I am your Telegram bot. I can handle text, images, and audio messages. How can I help you today?"
     )
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for /help command"""
@@ -57,6 +65,7 @@ You can send:
 """
     await update.message.reply_text(help_text)
 
+
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for regular text messages"""
     if str(update.message.chat_id) != CHAT_ID:
@@ -73,18 +82,18 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
     run = client.beta.threads.runs.create_and_poll(
-        thread_id=config["thread_id"], 
-        assistant_id="asst_KGI7hfOHHJlH367w9QSeQtbJ"
+        thread_id=config["thread_id"], assistant_id="asst_KGI7hfOHHJlH367w9QSeQtbJ"
     )
 
     thread_messages = client.beta.threads.messages.list(config["thread_id"])
-    
+
     response = ""
     for msg in thread_messages.data:
         if msg.run_id == run.id:
             response = msg.content[0].text.value
 
     await update.message.reply_text(response)
+
 
 async def handle_image_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for image messages"""
@@ -94,11 +103,11 @@ async def handle_image_message(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         # Get the largest available photo
         photo = max(update.message.photo, key=lambda x: x.file_size)
-        
+
         # Get the file URL directly from Telegram
         photo_file = await context.bot.get_file(photo.file_id)
         file_url = photo_file.file_path  # This is the direct URL to the image
-        
+
         logging.info(f"Received image URL: {file_url}")
 
         # Get caption if it exists
@@ -110,26 +119,17 @@ async def handle_image_message(update: Update, context: ContextTypes.DEFAULT_TYP
             thread_id=config["thread_id"],
             role="user",
             content=[
-                {
-                    "type": "text",
-                    "text": message_text
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": file_url
-                    }
-                }
-            ]
+                {"type": "text", "text": message_text},
+                {"type": "image_url", "image_url": {"url": file_url}},
+            ],
         )
 
         run = client.beta.threads.runs.create_and_poll(
-            thread_id=config["thread_id"],
-            assistant_id="asst_KGI7hfOHHJlH367w9QSeQtbJ"
+            thread_id=config["thread_id"], assistant_id="asst_KGI7hfOHHJlH367w9QSeQtbJ"
         )
 
         thread_messages = client.beta.threads.messages.list(config["thread_id"])
-        
+
         response = ""
         for msg in thread_messages.data:
             if msg.run_id == run.id:
@@ -139,46 +139,80 @@ async def handle_image_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     except Exception as e:
         logging.error(f"Error handling image: {str(e)}")
-        await update.message.reply_text("Sorry, I encountered an error processing your image.")
+        await update.message.reply_text(
+            "Sorry, I encountered an error processing your image."
+        )
 
-async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for voice messages"""
+
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for voice messages with transcription"""
     if str(update.message.chat_id) != CHAT_ID:
         return
 
-    # Get the voice message
-    voice = update.message.voice
-    voice_file = await context.bot.get_file(voice.file_id)
-    file_url = voice_file.file_path
-    
-    logging.info(f"Received voice message URL: {file_url}")
+    try:
+        # Get the voice message
+        voice = update.message.voice
+        voice_file = await context.bot.get_file(voice.file_id)
 
-    # For now, just acknowledge receipt of audio
-    message_text = f"{datetime.now()} - Received voice message (duration: {voice.duration}s)"
-    
-    thread_message = client.beta.threads.messages.create(
-        thread_id=config["thread_id"],
-        role="user",
-        content=message_text
-    )
+        # Generate filenames
+        base_filename = f"voice_{update.effective_user.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        ogg_path = VOICES_DIR / f"{base_filename}.ogg"
+        mp3_path = VOICES_DIR / f"{base_filename}.mp3"
 
-    run = client.beta.threads.runs.create_and_poll(
-        thread_id=config["thread_id"],
-        assistant_id="asst_KGI7hfOHHJlH367w9QSeQtbJ"
-    )
+        # Download the voice message
+        await voice_file.download_to_drive(ogg_path)
 
-    thread_messages = client.beta.threads.messages.list(config["thread_id"])
-    
-    response = ""
-    for msg in thread_messages.data:
-        if msg.run_id == run.id:
-            response = msg.content[0].text.value
+        # Convert OGG to MP3 using pydub
+        audio = AudioSegment.from_file(ogg_path, format="ogg")
+        audio.export(mp3_path, format="mp3")
 
-    await update.message.reply_text(response)
+        logging.info(f"Processing voice message: {mp3_path}")
+
+        # Transcribe the audio using Whisper
+        with open(mp3_path, "rb") as audio_file:
+            transcript = client.audio.transcriptions.create(
+                model="whisper-1", file=audio_file
+            )
+
+        # Create message with transcription
+        message_text = f"{datetime.now()} - {transcript.text}"
+        logging.info(f"Transcription: {transcript.text}")
+
+        # Send transcription to OpenAI assistant
+        thread_message = client.beta.threads.messages.create(
+            thread_id=config["thread_id"], role="user", content=message_text
+        )
+
+        # Get assistant's response
+        run = client.beta.threads.runs.create_and_poll(
+            thread_id=config["thread_id"], assistant_id="asst_KGI7hfOHHJlH367w9QSeQtbJ"
+        )
+
+        thread_messages = client.beta.threads.messages.list(config["thread_id"])
+
+        response = ""
+        for msg in thread_messages.data:
+            if msg.run_id == run.id:
+                response = msg.content[0].text.value
+
+        # Send both transcription and response
+        await update.message.reply_text(f"{response}")
+
+        # Cleanup temporary files
+        os.remove(ogg_path)
+        os.remove(mp3_path)
+
+    except Exception as e:
+        logging.error(f"Error handling voice message: {str(e)}")
+        await update.message.reply_text(
+            f"Sorry, I encountered an error processing your voice message: {str(e)}"
+        )
+
 
 async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Error handler"""
     logging.error(f"Update {update} caused error {context.error}")
+
 
 def main():
     """Main function to run the bot"""
@@ -189,9 +223,11 @@ def main():
         # Add handlers
         app.add_handler(CommandHandler("start", start_command))
         app.add_handler(CommandHandler("help", help_command))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+        app.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
+        )
         app.add_handler(MessageHandler(filters.PHOTO, handle_image_message))
-        app.add_handler(MessageHandler(filters.VOICE, handle_audio_message))
+        app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
 
         # Add error handler
         app.add_error_handler(error)
@@ -202,6 +238,7 @@ def main():
 
     except Exception as e:
         logging.error(f"Error running bot: {e}")
+
 
 if __name__ == "__main__":
     main()
