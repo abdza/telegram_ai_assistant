@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-# bot.py
 import io
 import json
 import logging
 import os
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 
@@ -24,45 +24,123 @@ logging.basicConfig(
 )
 
 script_path = os.path.abspath(__file__)
-# Get the directory containing the current script
 script_dir = os.path.dirname(script_path)
 
 # Create voices directory if it doesn't exist
 VOICES_DIR = Path(script_dir + "/voices")
 VOICES_DIR.mkdir(exist_ok=True)
 
+# Database setup
+DB_PATH = Path(script_dir + "/users.db")
 
-# Load configuration
+
+def init_db():
+    """Initialize SQLite database with users table"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            chat_id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """
+    )
+    conn.commit()
+    conn.close()
+
+
 def load_config():
+    """Load configuration from config.json"""
     with open(script_dir + "/config.json", "r") as config_file:
         return json.load(config_file)
 
 
 config = load_config()
-CHAT_ID = config["chat_id"]
 BOT_TOKEN = config["bot_token"]
+SERVICE_PASSWORD = config["service_password"]  # New configuration item
 client = OpenAI(api_key=config["OPENAI_API_KEY"])
+
+
+def is_user_subscribed(chat_id):
+    """Check if user is subscribed"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT thread_id FROM users WHERE chat_id = ?", (str(chat_id),))
+    result = c.fetchone()
+    conn.close()
+    return result is not None
+
+
+def get_user_thread(chat_id):
+    """Get user's thread ID"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT thread_id FROM users WHERE chat_id = ?", (str(chat_id),))
+    result = c.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+
+def add_user(chat_id, thread_id):
+    """Add new user to database"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO users (chat_id, thread_id) VALUES (?, ?)",
+        (str(chat_id), thread_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for /start command"""
-    if str(update.message.chat_id) != CHAT_ID:
+    await update.message.reply_text(
+        "Hello! I am your AI assistant bot. To subscribe to the service, please use:\n"
+        "/subscribe <password>\n\n"
+        "Once subscribed, I can handle text, images, and audio messages."
+    )
+
+
+async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for /subscribe command"""
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /subscribe <password>")
         return
 
+    if context.args[0] != SERVICE_PASSWORD:
+        await update.message.reply_text("Invalid password. Please try again.")
+        return
+
+    chat_id = str(update.message.chat_id)
+    if is_user_subscribed(chat_id):
+        await update.message.reply_text("You are already subscribed!")
+        return
+
+    # Create a new thread for the user
+    thread = client.beta.threads.create()
+    add_user(chat_id, thread.id)
+
     await update.message.reply_text(
-        "Hello! I am your Telegram bot. I can handle text, images, and audio messages. How can I help you today?"
+        "Successfully subscribed! You can now use the AI assistant."
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for /help command"""
-    if str(update.message.chat_id) != CHAT_ID:
+    if not is_user_subscribed(str(update.message.chat_id)):
+        await update.message.reply_text(
+            "Please subscribe first using /subscribe <password>"
+        )
         return
 
     help_text = """
 Available commands:
 /start - Start the bot
 /help - Show this help message
+/subscribe <password> - Subscribe to the service
 
 You can send:
 • Text messages
@@ -74,24 +152,27 @@ You can send:
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for regular text messages"""
-    if str(update.message.chat_id) != CHAT_ID:
+    chat_id = str(update.message.chat_id)
+    if not is_user_subscribed(chat_id):
+        await update.message.reply_text("I am just a dumb bot.. oh uh..")
         return
 
+    thread_id = get_user_thread(chat_id)
     message_type = update.message.chat.type
     text = str(datetime.now()) + " - " + update.message.text
     logging.info(f"Received text message: {text} in chat type: {message_type}")
 
     thread_message = client.beta.threads.messages.create(
-        config["thread_id"],
+        thread_id,
         role="user",
         content=text,
     )
 
     run = client.beta.threads.runs.create_and_poll(
-        thread_id=config["thread_id"], assistant_id="asst_KGI7hfOHHJlH367w9QSeQtbJ"
+        thread_id=thread_id, assistant_id=config["assistant_id"]
     )
 
-    thread_messages = client.beta.threads.messages.list(config["thread_id"])
+    thread_messages = client.beta.threads.messages.list(thread_id)
 
     response = ""
     for msg in thread_messages.data:
@@ -103,26 +184,24 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_image_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for image messages"""
-    if str(update.message.chat_id) != CHAT_ID:
+    chat_id = str(update.message.chat_id)
+    if not is_user_subscribed(chat_id):
+        await update.message.reply_text("I am just a dumb bot.. oh uh..")
         return
 
+    thread_id = get_user_thread(chat_id)
     try:
-        # Get the largest available photo
         photo = max(update.message.photo, key=lambda x: x.file_size)
-
-        # Get the file URL directly from Telegram
         photo_file = await context.bot.get_file(photo.file_id)
-        file_url = photo_file.file_path  # This is the direct URL to the image
+        file_url = photo_file.file_path
 
         logging.info(f"Received image URL: {file_url}")
 
-        # Get caption if it exists
         caption = update.message.caption or "Image received"
         message_text = f"{datetime.now()} - {caption}"
 
-        # Create message with image URL
         thread_message = client.beta.threads.messages.create(
-            thread_id=config["thread_id"],
+            thread_id=thread_id,
             role="user",
             content=[
                 {"type": "text", "text": message_text},
@@ -131,10 +210,10 @@ async def handle_image_message(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
         run = client.beta.threads.runs.create_and_poll(
-            thread_id=config["thread_id"], assistant_id="asst_KGI7hfOHHJlH367w9QSeQtbJ"
+            thread_id=thread_id, assistant_id=config["assistant_id"]
         )
 
-        thread_messages = client.beta.threads.messages.list(config["thread_id"])
+        thread_messages = client.beta.threads.messages.list(thread_id)
 
         response = ""
         for msg in thread_messages.data:
@@ -151,60 +230,53 @@ async def handle_image_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for voice messages with transcription"""
-    if str(update.message.chat_id) != CHAT_ID:
+    """Handler for voice messages"""
+    chat_id = str(update.message.chat_id)
+    if not is_user_subscribed(chat_id):
+        await update.message.reply_text("I am just a dumb bot.. oh uh..")
         return
 
+    thread_id = get_user_thread(chat_id)
     try:
-        # Get the voice message
         voice = update.message.voice
         voice_file = await context.bot.get_file(voice.file_id)
 
-        # Generate filenames
         base_filename = f"voice_{update.effective_user.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         ogg_path = VOICES_DIR / f"{base_filename}.ogg"
         mp3_path = VOICES_DIR / f"{base_filename}.mp3"
 
-        # Download the voice message
         await voice_file.download_to_drive(ogg_path)
 
-        # Convert OGG to MP3 using pydub
         audio = AudioSegment.from_file(ogg_path, format="ogg")
         audio.export(mp3_path, format="mp3")
 
         logging.info(f"Processing voice message: {mp3_path}")
 
-        # Transcribe the audio using Whisper
         with open(mp3_path, "rb") as audio_file:
             transcript = client.audio.translations.create(
                 model="whisper-1", file=audio_file
             )
 
-        # Create message with transcription
         message_text = f"{datetime.now()} - {transcript.text}"
         logging.info(f"Transcription: {transcript.text}")
 
-        # Send transcription to OpenAI assistant
         thread_message = client.beta.threads.messages.create(
-            thread_id=config["thread_id"], role="user", content=message_text
+            thread_id=thread_id, role="user", content=message_text
         )
 
-        # Get assistant's response
         run = client.beta.threads.runs.create_and_poll(
-            thread_id=config["thread_id"], assistant_id="asst_KGI7hfOHHJlH367w9QSeQtbJ"
+            thread_id=thread_id, assistant_id=config["assistant_id"]
         )
 
-        thread_messages = client.beta.threads.messages.list(config["thread_id"])
+        thread_messages = client.beta.threads.messages.list(thread_id)
 
         response = ""
         for msg in thread_messages.data:
             if msg.run_id == run.id:
                 response = msg.content[0].text.value
 
-        # Send both transcription and response
         await update.message.reply_text(f"{response}")
 
-        # Cleanup temporary files
         os.remove(ogg_path)
         os.remove(mp3_path)
 
@@ -217,32 +289,29 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for file uploads"""
-    if str(update.message.chat_id) != CHAT_ID:
+    chat_id = str(update.message.chat_id)
+    if not is_user_subscribed(chat_id):
+        await update.message.reply_text("I am just a dumb bot.. oh uh..")
         return
 
+    thread_id = get_user_thread(chat_id)
     try:
-        # Get file information
         file = update.message.document
         file_info = await context.bot.get_file(file.file_id)
 
         logging.info(f"Received file: {file.file_name}")
 
-        # Create a message with the file URL and any caption
         caption = update.message.caption or "File uploaded"
         message_text = f"{datetime.now()} - {caption}"
 
-        # Download file and convert to file-like object
         file_bytes = await file_info.download_as_bytearray()
         file_obj = io.BytesIO(file_bytes)
-        # Set the name attribute for proper MIME type detection
         file_obj.name = file.file_name
 
-        # Upload file to OpenAI
         file_response = client.files.create(file=file_obj, purpose="assistants")
 
-        # Send message with file to the thread
         thread_message = client.beta.threads.messages.create(
-            thread_id=config["thread_id"],
+            thread_id=thread_id,
             role="user",
             content=[{"type": "text", "text": message_text}],
             attachments=[
@@ -251,10 +320,10 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
         run = client.beta.threads.runs.create_and_poll(
-            thread_id=config["thread_id"], assistant_id="asst_KGI7hfOHHJlH367w9QSeQtbJ"
+            thread_id=thread_id, assistant_id=config["assistant_id"]
         )
 
-        thread_messages = client.beta.threads.messages.list(config["thread_id"])
+        thread_messages = client.beta.threads.messages.list(thread_id)
 
         response = ""
         for msg in thread_messages.data:
@@ -278,12 +347,16 @@ async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     """Main function to run the bot"""
     try:
+        # Initialize database
+        init_db()
+
         # Create application
         app = Application.builder().token(BOT_TOKEN).build()
 
         # Add handlers
         app.add_handler(CommandHandler("start", start_command))
         app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(CommandHandler("subscribe", subscribe_command))
         app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
         )
