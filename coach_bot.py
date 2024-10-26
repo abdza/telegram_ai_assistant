@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 # bot.py
 import io
 import json
@@ -22,14 +23,18 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 
+script_path = os.path.abspath(__file__)
+# Get the directory containing the current script
+script_dir = os.path.dirname(script_path)
+
 # Create voices directory if it doesn't exist
-VOICES_DIR = Path("voices")
+VOICES_DIR = Path(script_dir + "/voices")
 VOICES_DIR.mkdir(exist_ok=True)
 
 
 # Load configuration
 def load_config():
-    with open("config.json", "r") as config_file:
+    with open(script_dir + "/config.json", "r") as config_file:
         return json.load(config_file)
 
 
