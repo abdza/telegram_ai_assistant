@@ -171,7 +171,7 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
         # Transcribe the audio using Whisper
         with open(mp3_path, "rb") as audio_file:
-            transcript = client.audio.transcriptions.create(
+            transcript = client.audio.translations.create(
                 model="whisper-1", file=audio_file
             )
 
