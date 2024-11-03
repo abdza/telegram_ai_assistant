@@ -1,10 +1,11 @@
 #!/usr/bin/env python
+import argparse
 import io
 import json
 import logging
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from openai import OpenAI
@@ -35,19 +36,98 @@ DB_PATH = Path(script_dir + "/users.db")
 
 
 def init_db():
-    """Initialize SQLite database with users table"""
+    """Initialize SQLite database with users table and add last_interaction column"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
+    # Create users table if it doesn't exist
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
             chat_id TEXT PRIMARY KEY,
             thread_id TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_interaction TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """
     )
+
+    # Check if last_interaction column exists, add it if it doesn't
+    cursor = c.execute("PRAGMA table_info(users)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if "last_interaction" not in columns:
+        c.execute(
+            "ALTER TABLE users ADD COLUMN last_interaction TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        )
+
     conn.commit()
+    conn.close()
+
+
+def update_last_interaction(chat_id):
+    """Update the last interaction timestamp for a user"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE users SET last_interaction = ? WHERE chat_id = ?",
+        (datetime.now(), str(chat_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def morning_check():
+    """
+    Check all users and send a morning message if they haven't interacted today.
+    This function can be called from the command line using --morning-check
+    """
+    config = load_config()
+    client = OpenAI(api_key=config["OPENAI_API_KEY"])
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    # Get all users and their last interaction times
+    c.execute("SELECT chat_id, thread_id, last_interaction FROM users")
+    users = c.fetchall()
+
+    today = datetime.now().date()
+    morning_message = (
+        f"{datetime.now()} - Morning check-in: Keeping this thread active. "
+        "What does my day look like today?"
+    )
+
+    for user in users:
+        chat_id, thread_id, last_interaction = user
+        if last_interaction:
+            last_interaction = datetime.fromisoformat(last_interaction)
+            if last_interaction.date() < today:
+                try:
+                    # Send morning check-in message to the thread
+                    thread_message = client.beta.threads.messages.create(
+                        thread_id=thread_id,
+                        role="user",
+                        content=morning_message,
+                    )
+
+                    run = client.beta.threads.runs.create_and_poll(
+                        thread_id=thread_id, assistant_id=config["assistant_id"]
+                    )
+
+                    logging.info(f"Sent morning check-in for user {chat_id}")
+
+                    # Update last interaction time
+                    c.execute(
+                        "UPDATE users SET last_interaction = ? WHERE chat_id = ?",
+                        (datetime.now(), chat_id),
+                    )
+                    conn.commit()
+
+                except Exception as e:
+                    logging.error(
+                        f"Error sending morning check-in to user {chat_id}: {str(e)}"
+                    )
+
     conn.close()
 
 
@@ -157,6 +237,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("I am just a dumb bot.. oh uh..")
         return
 
+    # Update last interaction time
+    update_last_interaction(chat_id)
+
     thread_id = get_user_thread(chat_id)
     message_type = update.message.chat.type
     text = str(datetime.now()) + " - " + update.message.text
@@ -188,7 +271,11 @@ async def handle_image_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("I am just a dumb bot.. oh uh..")
         return
 
+    # Update last interaction time
+    update_last_interaction(chat_id)
+
     thread_id = get_user_thread(chat_id)
+
     try:
         photo = max(update.message.photo, key=lambda x: x.file_size)
         photo_file = await context.bot.get_file(photo.file_id)
@@ -234,6 +321,9 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if not is_user_subscribed(chat_id):
         await update.message.reply_text("I am just a dumb bot.. oh uh..")
         return
+
+    # Update last interaction time
+    update_last_interaction(chat_id)
 
     thread_id = get_user_thread(chat_id)
     try:
@@ -293,6 +383,9 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("I am just a dumb bot.. oh uh..")
         return
 
+    # Update last interaction time
+    update_last_interaction(chat_id)
+
     thread_id = get_user_thread(chat_id)
     try:
         file = update.message.document
@@ -346,8 +439,22 @@ async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     """Main function to run the bot"""
     try:
+        # Parse command line arguments
+        parser = argparse.ArgumentParser(description="Run the coach bot")
+        parser.add_argument(
+            "--morning-check",
+            action="store_true",
+            help="Perform morning check-in for inactive users",
+        )
+        args = parser.parse_args()
+
         # Initialize database
         init_db()
+
+        # If morning-check flag is set, run morning check and exit
+        if args.morning_check:
+            morning_check()
+            return
 
         # Create application
         app = Application.builder().token(BOT_TOKEN).build()
