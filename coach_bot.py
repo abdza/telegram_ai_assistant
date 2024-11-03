@@ -172,12 +172,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         thread_id=thread_id, assistant_id=config["assistant_id"]
     )
 
-    thread_messages = client.beta.threads.messages.list(thread_id)
+    thread_messages = list(
+        client.beta.threads.messages.list(thread_id=thread_id, run_id=run.id)
+    )
 
-    response = ""
-    for msg in thread_messages.data:
-        if msg.run_id == run.id:
-            response = msg.content[0].text.value
+    response = thread_messages[0].content[0].text.value
 
     await update.message.reply_text(response)
 
